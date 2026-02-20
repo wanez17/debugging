@@ -1,0 +1,104 @@
+<?php
+session_start();
+
+ini_set('display_errors', 1);
+error_reporting(E_ALL);
+ini_set('error_log', __DIR__ . '/webhook_errors.log');
+
+// contains session info, DB connection & paystack secret
+require_once 'config.php'; 
+
+// Read raw payload
+$raw = file_get_contents("php://input");
+$data = json_decode($raw, true);
+error_log("response received");
+
+//Verify Paystack signature
+$signature = $_SERVER['HTTP_X_PAYSTACK_SIGNATURE'] ?? '';
+$expected  = hash_hmac('sha512', $raw, $paystack_topup_secret_key);
+error_log("secret key established");
+
+if (!hash_equals($expected, $signature)) {
+    http_response_code(400);
+    error_log("Invalid signature");
+    exit('Invalid signature');
+}
+
+// Only handle successful charges
+if (($data['event'] ?? '') !== 'charge.success') {
+    http_response_code(200);
+    error_log("Event ignored");
+    exit('Event ignored');
+}
+
+$tx = $data['data'];
+
+// Extract fields safely
+$reference   = mysqli_real_escape_string($conn, $tx['reference']);
+$amount      = (float) $tx['amount']; // GHS MoMo → NO /100
+$currency    = $tx['currency'];
+$status      = $tx['status'];
+$paid_at     = date('Y-m-d H:i:s', strtocotime($tx['paid_at']));
+$agent_id    = (int) ($tx['metadata']['agent_id'] ?? 0);
+$gateway_msg = mysqli_real_escape_string($conn, $tx['gateway_response'] ?? '');
+$email       = mysqli_real_escape_string($conn, $tx['customer']['email'] ?? '');
+
+/*Idempotency check (VERY IMPORTANT)
+$check = mysqli_query(
+    $conn,
+    "SELECT id FROM transactions WHERE reference='$reference' LIMIT 1"
+);
+
+if (mysqli_num_rows($check) > 0) {
+    http_response_code(200);
+    exit('Already processed');
+}*/
+
+// Begin atomic transaction
+mysqli_begin_transaction($conn);
+
+try {
+    /* Save transaction recording logs
+    mysqli_query($conn, "
+        INSERT INTO transactions 
+        (reference, agent_id, amount, currency, status, paid_at, email, gateway_response)
+        VALUES 
+        ('$reference', $agent_id, $amount, '$currency', '$status', '$paid_at', '$email', '$gateway_msg')
+    ");*/
+
+    // Credit agent wallet
+    $wallet = mysqli_query(
+        $conn,
+        "SELECT `account_balance` FROM `financial_account` WHERE `agent_id`=$agent_id FOR UPDATE"
+    );
+    error_log("after account crediting");
+
+    if (mysqli_num_rows($wallet) === 0) {
+        error_log("no agent id found");
+        throw new Exception('Agent not found');
+    }
+
+    $row = mysqli_fetch_assoc($wallet);
+    $new_balance = $row['account_balance'] + $amount;
+    
+    error_log("before updating financial account");
+    mysqli_query(
+        $conn,
+        "UPDATE `financial_account` SET `account_balance`=$new_balance WHERE `agent_id`=$agent_id"
+    );
+    error_log("after financial account");
+
+    // Commit everything
+    mysqli_commit($conn);
+
+    http_response_code(200);
+    error_log("webhook processed");
+    echo 'Webhook processed';
+
+} catch (Exception $e) {
+    mysqli_rollback($conn);
+    error_log('Webhook error: ' . $e->getMessage());
+    http_response_code(200);
+    echo 'Webhook failed';
+}
+?>
