@@ -9,4 +9,4 @@
 
 // 3. Secret key is working and active
 
-// 4. But when I run the tesy payment, nothing logs. (even after I turned off ModSecurity)
+// 4. But when I run the test payment on my site, nothing logs. (even after I turned off ModSecurity)
